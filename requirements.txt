@@ -1,0 +1,9 @@
+py-clob-client>=0.19.0
+python-dotenv
+pandas
+requests
+web3
+aiohttp
+ujson
+uvloop
+colorama
