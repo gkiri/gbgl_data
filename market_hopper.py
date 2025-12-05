@@ -20,11 +20,14 @@ Implementation:
 """
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from collections import deque
 from datetime import datetime, timezone
+import aiohttp
+from contextlib import suppress
 
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
@@ -39,6 +42,9 @@ from config import (
     BA_SWEEP_BURST_SIZE, BA_SWEEP_INTERVAL_MS, BA_ORDER_SIZE,
     BA_MORNING_BONUS_START, BA_MORNING_BONUS_END, BA_MORNING_BONUS_MULT,
     BA_FILLS_PER_SWEEP,
+    WS_URL,
+    ENABLE_ONCHAIN_REDEEM,
+    REDEEM_WINNING_INDEX_SET,
 )
 from utils import get_target_markets, warm_connections
 from trade_logger import TradeLogger
@@ -63,8 +69,12 @@ class MarketState:
     # Book data
     best_bid_yes: float = 0.0
     best_ask_yes: float = 1.0
+    best_bid_yes_size: float = 0.0
+    best_ask_yes_size: float = 0.0
     best_bid_no: float = 0.0
     best_ask_no: float = 1.0
+    best_bid_no_size: float = 0.0
+    best_ask_no_size: float = 0.0
     
     # Derived metrics
     spread_yes: float = 1.0
@@ -78,12 +88,26 @@ class MarketState:
     # Opportunity score
     score: float = 0.0
     
-    def update_book(self, bid_yes: float, ask_yes: float, bid_no: float, ask_no: float):
+    def update_book(
+        self,
+        bid_yes: float,
+        ask_yes: float,
+        bid_no: float,
+        ask_no: float,
+        bid_yes_size: float = 0.0,
+        ask_yes_size: float = 0.0,
+        bid_no_size: float = 0.0,
+        ask_no_size: float = 0.0,
+    ):
         """Update order book data"""
         self.best_bid_yes = bid_yes
         self.best_ask_yes = ask_yes
         self.best_bid_no = bid_no
         self.best_ask_no = ask_no
+        self.best_bid_yes_size = bid_yes_size
+        self.best_ask_yes_size = ask_yes_size
+        self.best_bid_no_size = bid_no_size
+        self.best_ask_no_size = ask_no_size
         self.spread_yes = ask_yes - bid_yes
         self.spread_no = ask_no - bid_no
         
@@ -104,8 +128,12 @@ class MarketState:
             timestamp=time.time(),
             best_bid_yes=self.best_bid_yes,
             best_ask_yes=self.best_ask_yes,
+            best_bid_yes_size=self.best_bid_yes_size,
+            best_ask_yes_size=self.best_ask_yes_size,
             best_bid_no=self.best_bid_no,
             best_ask_no=self.best_ask_no,
+            best_bid_no_size=self.best_bid_no_size,
+            best_ask_no_size=self.best_ask_no_size,
         )
 
 
@@ -147,6 +175,10 @@ class MarketHopper:
         self.focus_start_time: float = 0.0
         self.total_sweeps: int = 0
         self.target_fills: int = 20
+        self.token_side: Dict[str, Tuple[str, str]] = {}  # token_id -> (market_label, 'YES'/'NO')
+        self.last_ws_update: Dict[str, float] = {}
+        self.ws_task: Optional[asyncio.Task] = None
+        self.ws_connected: bool = False
         
         # Session tracking
         self.session_start: float = time.time()
@@ -346,6 +378,8 @@ class MarketHopper:
         
         # Clear old markets for refresh
         self.markets.clear()
+        self.token_side.clear()
+        self.last_ws_update.clear()
         
         # Get BTC market
         btc_markets = get_target_markets(
@@ -395,6 +429,7 @@ class MarketHopper:
         print(f"[Hopper] 📊 Monitoring {len(self.markets)} markets")
         print(f"[Hopper] 🐙 Strategy: BUNDLE ARBITRAGE")
         print(f"[Hopper]    Target: bundle_cost < ${BA_MAX_BUNDLE_COST:.2f}")
+        await self._restart_ws_listener()
     
     async def _fetch_tokens(self, asset_label: str):
         """Fetch token IDs for a market"""
@@ -419,10 +454,136 @@ class MarketHopper:
             
             if market.yes_token and market.no_token:
                 print(f"[Hopper] 🔑 {asset_label} tokens: YES={market.yes_token[:16]}... NO={market.no_token[:16]}...")
+                self.token_side[market.yes_token] = (asset_label, 'YES')
+                self.token_side[market.no_token] = (asset_label, 'NO')
             else:
                 print(f"[Hopper] ⚠️ {asset_label} MISSING TOKENS!")
         except Exception as e:
             print(f"[Hopper] ⚠️ Failed to fetch {asset_label} tokens: {e}")
+
+    async def _restart_ws_listener(self):
+        """Restart websocket listener after markets refresh."""
+        if not WS_URL:
+            return
+        if self.ws_task:
+            self.ws_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.ws_task
+        self.ws_task = asyncio.create_task(self._start_ws_listener())
+
+    async def _start_ws_listener(self):
+        """Listen to Polymarket live orderbook updates for all tracked tokens."""
+        if not WS_URL:
+            return
+        while not self.stop_event.is_set():
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(WS_URL, heartbeat=20) as ws:
+                        await self._subscribe_tokens(ws)
+                        self.ws_connected = True
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    data = json.loads(msg.data)
+                                except Exception:
+                                    continue
+                                await self._handle_ws_message(data)
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+            except Exception as e:
+                self.ws_connected = False
+                print(f"[Hopper] ⚠️ WS error: {e} (reconnecting in 1s)")
+                await asyncio.sleep(1)
+            finally:
+                self.ws_connected = False
+        self.ws_connected = False
+
+    async def _subscribe_tokens(self, ws):
+        """Subscribe to orderbook updates for all known tokens."""
+        tokens = list(self.token_side.keys())
+        if not tokens:
+            return
+        payload = {
+            "type": "subscribe",
+            "channel": "orderbook",
+            "marketIds": tokens,
+        }
+        try:
+            await ws.send_json(payload)
+            print(f"[Hopper] 🔗 WS subscribed to {len(tokens)} tokens")
+        except Exception as e:
+            print(f"[Hopper] ⚠️ WS subscribe failed: {e}")
+
+    @staticmethod
+    def _extract_top(side_data, default_price: float, default_size: float) -> Tuple[float, float]:
+        """Parse top-of-book price/size from various possible payload shapes."""
+        if not side_data:
+            return default_price, default_size
+        first = side_data[0]
+        try:
+            if isinstance(first, dict):
+                price = float(first.get("price", default_price))
+                size = float(first.get("size", default_size))
+            elif isinstance(first, (list, tuple)) and len(first) >= 2:
+                price = float(first[0])
+                size = float(first[1])
+            else:
+                price, size = default_price, default_size
+            return price, size
+        except Exception:
+            return default_price, default_size
+
+    async def _handle_ws_message(self, data: Dict):
+        """Handle a single websocket orderbook delta."""
+        token_id = data.get("marketId") or data.get("tokenId") or data.get("id")
+        if not token_id or token_id not in self.token_side:
+            return
+
+        bids = data.get("bids") or data.get("bid") or data.get("buy") or []
+        asks = data.get("asks") or data.get("ask") or data.get("sell") or []
+
+        bid_price, bid_size = self._extract_top(bids, default_price=0.01, default_size=0.0)
+        ask_price, ask_size = self._extract_top(asks, default_price=0.99, default_size=0.0)
+
+        label, side = self.token_side[token_id]
+        market = self.markets.get(label)
+        if not market:
+            return
+
+        # Update the correct side while preserving the other side's latest values.
+        if side == 'YES':
+            market.update_book(
+                bid_yes=bid_price,
+                ask_yes=ask_price,
+                bid_no=market.best_bid_no,
+                ask_no=market.best_ask_no,
+                bid_yes_size=bid_size,
+                ask_yes_size=ask_size,
+                bid_no_size=market.best_bid_no_size,
+                ask_no_size=market.best_ask_no_size,
+            )
+        else:
+            market.update_book(
+                bid_yes=market.best_bid_yes,
+                ask_yes=market.best_ask_yes,
+                bid_no=bid_price,
+                ask_no=ask_price,
+                bid_yes_size=market.best_bid_yes_size,
+                ask_yes_size=market.best_ask_yes_size,
+                bid_no_size=bid_size,
+                ask_no_size=ask_size,
+            )
+
+        self.last_ws_update[label] = time.time()
+
+    def _is_book_stale(self, label: Optional[str], stale_after: float = 2.0) -> bool:
+        """Detect if websocket data is stale for a market label."""
+        if not label:
+            return True
+        ts = self.last_ws_update.get(label)
+        if ts is None:
+            return True
+        return (time.time() - ts) > stale_after
     
     async def poll_market_data(self):
         """Poll REST APIs for market data (sequential to avoid rate limits)"""
@@ -438,11 +599,18 @@ class MarketHopper:
                 # Extract best prices
                 bid_yes = float(yes_book.bids[0].price) if yes_book.bids else 0.01
                 ask_yes = float(yes_book.asks[0].price) if yes_book.asks else 0.99
+                bid_yes_size = float(yes_book.bids[0].size) if yes_book.bids else 0.0
+                ask_yes_size = float(yes_book.asks[0].size) if yes_book.asks else 0.0
                 bid_no = float(no_book.bids[0].price) if no_book.bids else 0.01
                 ask_no = float(no_book.asks[0].price) if no_book.asks else 0.99
+                bid_no_size = float(no_book.bids[0].size) if no_book.bids else 0.0
+                ask_no_size = float(no_book.asks[0].size) if no_book.asks else 0.0
                 
                 # Update market state
-                market.update_book(bid_yes, ask_yes, bid_no, ask_no)
+                market.update_book(
+                    bid_yes, ask_yes, bid_no, ask_no,
+                    bid_yes_size, ask_yes_size, bid_no_size, ask_no_size
+                )
                 
             except Exception as e:
                 err_str = str(e)
@@ -509,7 +677,8 @@ class MarketHopper:
                     print("[Hopper] ✅ Markets refreshed for new window")
                 
                 # Poll market data
-                await self.poll_market_data()
+                if (not self.ws_connected) or self._is_book_stale(self.current_focus, stale_after=1.0):
+                    await self.poll_market_data()
                 
                 # Log market state periodically
                 if iteration % 10 == 0:
@@ -539,6 +708,10 @@ class MarketHopper:
                 await asyncio.sleep(1)
         
         print(f"\n[Hopper] 🏁 Session ended")
+        if self.ws_task:
+            self.ws_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.ws_task
         self._print_stats()
     
     def _should_refresh_markets(self) -> bool:
@@ -556,6 +729,16 @@ class MarketHopper:
                 
                 if time_remaining < 30:
                     print(f"[Hopper] ⚠️ {label} market expires in {time_remaining:.0f}s")
+                    if ENABLE_ONCHAIN_REDEEM and REDEEM_WINNING_INDEX_SET and self.arbitrageur:
+                        try:
+                            winner_idx = int(REDEEM_WINNING_INDEX_SET)
+                            asyncio.create_task(
+                                self.arbitrageur.redeem_winning_tokens(
+                                    market.condition_id, [winner_idx]
+                                )
+                            )
+                        except Exception as e:
+                            print(f"[Hopper] ⚠️ Redemption enqueue failed: {e}")
                     return True
                     
             except Exception as e:

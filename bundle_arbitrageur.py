@@ -33,7 +33,9 @@ from py_clob_client.constants import POLYGON
 
 from config import (
     PRIVATE_KEY, POLYGON_ADDRESS,
+    ENABLE_ONCHAIN_MERGE, ENABLE_ONCHAIN_REDEEM, REDEEM_WINNING_INDEX_SET,
 )
+from chain_client import CTFSettlementClient
 from trade_logger import TradeLogger
 
 
@@ -267,12 +269,16 @@ class OrderBookState:
     # YES side
     best_bid_yes: float = 0.0
     best_ask_yes: float = 1.0
+    best_bid_yes_size: float = 0.0
+    best_ask_yes_size: float = 0.0
     depth_yes_bids: int = 0
     depth_yes_asks: int = 0
     
     # NO side  
     best_bid_no: float = 0.0
     best_ask_no: float = 1.0
+    best_bid_no_size: float = 0.0
+    best_ask_no_size: float = 0.0
     depth_no_bids: int = 0
     depth_no_asks: int = 0
     
@@ -618,31 +624,37 @@ class DualSideSweeper:
         yes_count = 0
         no_count = 0
         max_per_side = target_fills // 2 + 1
+        yes_top_liquidity = book.best_ask_yes_size if book.best_ask_yes_size > 0 else float("inf")
+        no_top_liquidity = book.best_ask_no_size if book.best_ask_no_size > 0 else float("inf")
+        yes_limit = max_per_side if yes_top_liquidity == float("inf") else int(yes_top_liquidity // base_yes)
+        no_limit = max_per_side if no_top_liquidity == float("inf") else int(no_top_liquidity // base_no)
+        yes_limit = max(0, min(max_per_side, yes_limit))
+        no_limit = max(0, min(max_per_side, no_limit))
         
         for i in range(target_fills):
             # Decide which side based on balance
             if position.yes_shares > position.no_shares * 1.1:
                 # Favor NO to catch up
-                if place_no and no_count < max_per_side:
+                if place_no and no_count < no_limit:
                     orders_to_place.append(('NO', no_price, base_no))
                     no_count += 1
-                elif place_yes and yes_count < max_per_side:
+                elif place_yes and yes_count < yes_limit:
                     orders_to_place.append(('YES', yes_price, base_yes))
                     yes_count += 1
             elif position.no_shares > position.yes_shares * 1.1:
                 # Favor YES to catch up
-                if place_yes and yes_count < max_per_side:
+                if place_yes and yes_count < yes_limit:
                     orders_to_place.append(('YES', yes_price, base_yes))
                     yes_count += 1
-                elif place_no and no_count < max_per_side:
+                elif place_no and no_count < no_limit:
                     orders_to_place.append(('NO', no_price, base_no))
                     no_count += 1
             else:
                 # Balanced - alternate
-                if i % 2 == 0 and place_yes and yes_count < max_per_side:
+                if i % 2 == 0 and place_yes and yes_count < yes_limit:
                     orders_to_place.append(('YES', yes_price, base_yes))
                     yes_count += 1
-                elif place_no and no_count < max_per_side:
+                elif place_no and no_count < no_limit:
                     orders_to_place.append(('NO', no_price, base_no))
                     no_count += 1
         
@@ -719,6 +731,7 @@ class BundleArbitrageur:
         self.balancer = PositionBalancer(self.config)
         self.position = Position()
         self.sweeper: Optional[DualSideSweeper] = None
+        self.settlement_client: Optional[CTFSettlementClient] = None
         
         # CLOB client
         self.clob_client: Optional[ClobClient] = None
@@ -756,6 +769,8 @@ class BundleArbitrageur:
         
         # Initialize sweeper
         self.sweeper = DualSideSweeper(self.clob_client, self.config, self.logger)
+        if (ENABLE_ONCHAIN_MERGE or ENABLE_ONCHAIN_REDEEM) and not self.settlement_client:
+            self.settlement_client = CTFSettlementClient()
     
     def set_market(self, yes_token: str, no_token: str, market_slug: str = "", condition_id: str = ""):
         """Set the market tokens to trade"""
@@ -830,7 +845,7 @@ class BundleArbitrageur:
         if total_fills > 0:
             # Auto-merge if profitable
             if self.position.bundle_cost < 1.0 and self.position.hedged_shares > 0:
-                merged_profit = self.position.auto_merge()
+                merged_profit = await self._settle_hedged_pairs()
                 if merged_profit > 0:
                     print(f"[BundleArb] 💰 AUTO-MERGE: +${merged_profit:.2f} realized")
             
@@ -880,6 +895,40 @@ class BundleArbitrageur:
             roi = (pos.total_pnl / pos.total_exposure) * 100
             print(f"ROI:                  {roi:+.2f}%")
         print("="*65)
+
+    async def _settle_hedged_pairs(self) -> float:
+        """
+        Merge hedged YES/NO pairs on-chain (if enabled) and update local P&L.
+        Returns realized profit.
+        """
+        hedged = self.position.hedged_shares
+        if hedged <= 0 or self.position.bundle_cost >= 1.0:
+            return 0.0
+
+        if self.settlement_client and ENABLE_ONCHAIN_MERGE:
+            result = await self.settlement_client.merge_positions(self.condition_id, hedged)
+            if result.tx_hash:
+                print(f"[BundleArb] 🔗 On-chain merge submitted: {result.tx_hash}")
+            else:
+                print(f"[BundleArb] ⚠️ On-chain merge skipped: {result.error}")
+
+        # Update local accounting regardless so we do not double-count exposure.
+        realized = self.position.auto_merge()
+        return realized
+
+    async def redeem_winning_tokens(self, condition_id: str, index_sets: List[int]) -> Optional[str]:
+        """
+        Redeem resolved winning tokens for USDC if enabled. Returns tx hash.
+        """
+        if not self.settlement_client or not ENABLE_ONCHAIN_REDEEM:
+            return None
+
+        result = await self.settlement_client.redeem_positions(condition_id, index_sets)
+        if result.tx_hash:
+            print(f"[BundleArb] 🏁 Redemption submitted for {condition_id}: {result.tx_hash}")
+        else:
+            print(f"[BundleArb] ⚠️ Redemption skipped: {result.error}")
+        return result.tx_hash if result.tx_hash else None
 
 
 # =============================================================================
