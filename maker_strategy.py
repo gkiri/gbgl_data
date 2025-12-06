@@ -1,9 +1,13 @@
 import asyncio
 import os
 import time
+import json
+import threading
 import contextlib
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 from py_clob_client.client import ClobClient
@@ -65,6 +69,32 @@ class MarketData:
         if total == 0: return 0.5
         return mid_yes / total
 
+
+class MakerJsonLogger:
+    """
+    Comprehensive JSONL logger for maker events.
+    Writes to data/maker_logs/maker_session_<ts>.jsonl
+    """
+
+    def __init__(self, log_dir: str = "data/maker_logs"):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.session_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        self.session_file = self.log_dir / f"maker_session_{self.session_id}.jsonl"
+        self._lock = threading.Lock()
+        self.log({"event_type": "session_start"})
+
+    def log(self, record: Dict):
+        rec = record.copy()
+        rec.setdefault("ts", int(time.time()))
+        rec.setdefault("session_id", self.session_id)
+        try:
+            with self._lock:
+                with open(self.session_file, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+        except Exception as e:
+            print(f"[MakerLog] write error: {e}")
+
 class MakerStrategy:
     def __init__(self):
         self.clob_client: Optional[ClobClient] = None
@@ -78,6 +108,7 @@ class MakerStrategy:
         }
         self.running = True
         self.binance_feed: Optional[BinanceFeed] = None
+        self.event_logger = MakerJsonLogger(log_dir="data/maker_logs")
 
     def init_client(self):
         print("[Maker] 🔐 Initializing CLOB client...")
@@ -104,6 +135,13 @@ class MakerStrategy:
                 
             m = found[0]
             print(f"[Maker] ✅ Found {label}: {m.get('question')}")
+            self.event_logger.log({
+                "event_type": "market_found",
+                "label": label,
+                "market_slug": m.get('market_slug'),
+                "condition_id": m.get('condition_id'),
+                "question": m.get('question'),
+            })
             
             # Get Token IDs and ensure market is tradable on CLOB
             try:
@@ -154,6 +192,13 @@ class MakerStrategy:
                         self.clob_client.get_order_book(no_id)
                     except Exception:
                         print(f"[Maker] ⚠️ {label}: Skipping - token orderbook not available (404)")
+                        self.event_logger.log({
+                            "event_type": "market_skip",
+                            "label": label,
+                            "reason": "orderbook_missing",
+                            "yes_token": yes_id,
+                            "no_token": no_id,
+                        })
                         continue
 
                     self.markets[label] = MarketData(
@@ -167,9 +212,19 @@ class MakerStrategy:
                     print(f"[Maker]    Tokens: YES={yes_id[:10]}... NO={no_id[:10]}... Strike={strike}")
                 else:
                     print(f"[Maker] ❌ Could not identify tokens for {label}")
+                    self.event_logger.log({
+                        "event_type": "market_error",
+                        "label": label,
+                        "reason": "token_id_missing",
+                    })
                     
             except Exception as e:
                 print(f"[Maker] ❌ Error fetching details for {label}: {e}")
+                self.event_logger.log({
+                    "event_type": "market_error",
+                    "label": label,
+                    "reason": str(e),
+                })
 
     async def cancel_all_orders(self, token_ids: List[str]):
         """Cancel open orders for provided token_ids by tracked order IDs."""
@@ -238,6 +293,11 @@ class MakerStrategy:
                 print(f"[Maker] ⚠️ Error updating book for {label}: {e}")
                 if "No orderbook exists" in str(e):
                     to_remove.append(label)
+                self.event_logger.log({
+                    "event_type": "book_error",
+                    "label": label,
+                    "reason": str(e),
+                })
 
         if to_remove:
             for label in to_remove:
@@ -246,6 +306,11 @@ class MakerStrategy:
                     await self.cancel_all_orders([market.yes_token, market.no_token])
                 self.markets.pop(label, None)
                 print(f"[Maker] ❌ Dropping {label} - orderbook missing/expired")
+                self.event_logger.log({
+                    "event_type": "market_drop",
+                    "label": label,
+                    "reason": "orderbook_missing",
+                })
 
     def calculate_my_bids(self, market: MarketData, asset_label: str) -> Tuple[Optional[float], Optional[float]]:
         """
@@ -322,6 +387,31 @@ class MakerStrategy:
                 target_no = max(0.0, target_no - MAKER_TICK_SIZE)
                 target_yes = round(min(0.99, target_yes + MAKER_TICK_SIZE), 2)
 
+            # Log planned quotes and current book/position
+            self.event_logger.log({
+                "event_type": "quote_plan",
+                "label": label,
+                "market_slug": market.slug,
+                "condition_id": market.condition_id,
+                "bids": {
+                    "yes": target_yes,
+                    "no": target_no,
+                    "size": MAKER_ORDER_SIZE,
+                    "max_bundle": MAKER_MAX_BUNDLE_COST,
+                },
+                "book": {
+                    "best_bid_yes": market.best_bid_yes,
+                    "best_ask_yes": market.best_ask_yes,
+                    "best_bid_no": market.best_bid_no,
+                    "best_ask_no": market.best_ask_no,
+                    "implied_prob": market.implied_probability,
+                },
+                "position": {
+                    "yes": self.position.get(label, {}).get('YES', 0.0),
+                    "no": self.position.get(label, {}).get('NO', 0.0),
+                },
+            })
+
             orders_to_place = []
             tokens_to_cancel: List[str] = []
 
@@ -359,8 +449,25 @@ class MakerStrategy:
                         if isinstance(resp, dict):
                             oid = resp.get('orderID') or resp.get('id')
                         self._record_quote(o.token_id, o.price, oid)
+                        self.event_logger.log({
+                            "event_type": "order_post",
+                            "label": label,
+                            "token_id": o.token_id,
+                            "price": o.price,
+                            "size": o.size,
+                            "side": "BUY",
+                            "order_id": oid,
+                            "status": resp.get('status') if isinstance(resp, dict) else None,
+                        })
                 except Exception as e:
                     print(f"[Maker] ⚠️ Order placement failed: {e}")
+                    self.event_logger.log({
+                        "event_type": "order_post_error",
+                        "label": label,
+                        "error": str(e),
+                        "tokens": tokens_to_cancel,
+                        "bids": {"yes": target_yes, "no": target_no},
+                    })
             else:
                 print(f"[Maker] 💤 {label}: No quote changes (holding book)")
 
