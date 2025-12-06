@@ -63,24 +63,31 @@ pip install -r requirements.txt
 
 Use `screen` to keep the bots running even after you disconnect.
 
-### Option A: Run the Market Hopper (Taker Bot)
+## A/B Testing: Taker vs Maker (us-east-1)
+
+Prereqs:
+- Region: us-east-1
+- Deps: `pip install -r requirements.txt` (scipy required for maker pricing)
+- Relaxed taker thresholds baked in defaults (BA_MAX_BUNDLE_COST=1.005, BA_CHEAP_SIDE_THRESHOLD=0.99) to force fills during testing.
+
+### Taker Bot (Bundle Arbitrage)
 Best for sniping existing opportunities.
 
 ```bash
 # Start a new screen session
-screen -S hopper
+screen -S taker
 
 # Activate venv (if not active)
 source venv/bin/activate
 
-# Run the bot (runs indefinitely)
-python3 main_hopper.py
+# Run the taker entrypoint
+./run_taker.sh
 
 # To detach (keep running in background): Press Ctrl+A, then D
 ```
 
-### Option B: Run the Market Maker (Liquidity Provider)
-Best for capturing spread in illiquid markets (Gabagool Style).
+### Maker Bot (Binance-fed quoting)
+Quotes using Binance Futures BTC/ETH bookTicker as the external signal.
 
 ```bash
 # Start a new screen session (or detach the other one first)
@@ -89,7 +96,7 @@ screen -S maker
 # Activate venv
 source venv/bin/activate
 
-# Run the maker script
+# Run the maker entrypoint
 ./run_maker.sh
 
 # To detach: Press Ctrl+A, then D
@@ -97,7 +104,7 @@ source venv/bin/activate
 
 To resume looking at the logs later:
 ```bash
-screen -r hopper
+screen -r taker
 # or
 screen -r maker
 ```

@@ -18,6 +18,8 @@ from config import (
     RPC_URL
 )
 from utils import get_target_markets, warm_connections, get_http_session
+from binance_client import BinanceFeed
+from pricing_engine import calculate_fair_probability, get_time_to_expiry
 
 # Load env so MAKER_* are populated
 load_dotenv()
@@ -70,6 +72,7 @@ class MakerStrategy:
             'ETH': {'YES': 0.0, 'NO': 0.0},
         }
         self.running = True
+        self.binance_feed: Optional[BinanceFeed] = None
 
     def init_client(self):
         print("[Maker] 🔐 Initializing CLOB client...")
@@ -104,7 +107,7 @@ class MakerStrategy:
                 accepting = market_resp.get('accepting_orders') if isinstance(market_resp, dict) else getattr(market_resp, 'accepting_orders', None)
                 closed = market_resp.get('closed') if isinstance(market_resp, dict) else getattr(market_resp, 'closed', None)
                 if accepting is False or closed is True:
-                    print(f\"[Maker] ❌ {label} market not accepting orders or closed\")
+                    print(f"[Maker] ❌ {label} market not accepting orders or closed")
                     continue
                 tokens = market_resp.get('tokens', []) if isinstance(market_resp, dict) else market_resp.tokens
                 
@@ -117,13 +120,20 @@ class MakerStrategy:
                     elif outcome in ['NO', 'DOWN']: no_id = tid
                 
                 if yes_id and no_id:
+                    # Strike = spot at discovery (preferred), fallback to None
+                    strike = None
+                    if self.binance_feed:
+                        strike = self.binance_feed.get_price(label)
+
                     self.markets[label] = MarketData(
                         slug=m.get('market_slug'),
                         condition_id=c_id,
                         yes_token=yes_id,
-                        no_token=no_id
+                        no_token=no_id,
+                        strike_price=strike,
+                        end_date_iso=m.get('end_date_iso') or m.get('endDate') or ""
                     )
-                    print(f"[Maker]    Tokens: YES={yes_id[:10]}... NO={no_id[:10]}...")
+                    print(f"[Maker]    Tokens: YES={yes_id[:10]}... NO={no_id[:10]}... Strike={strike}")
                 else:
                     print(f"[Maker] ❌ Could not identify tokens for {label}")
                     
@@ -172,7 +182,7 @@ class MakerStrategy:
             except Exception as e:
                 print(f"[Maker] ⚠️ Error updating book for {label}: {e}")
 
-    def calculate_my_bids(self, market: MarketData) -> Tuple[Optional[float], Optional[float]]:
+    def calculate_my_bids(self, market: MarketData, asset_label: str) -> Tuple[Optional[float], Optional[float]]:
         """
         Calculate optimal bid prices.
         Strategy:
@@ -183,19 +193,19 @@ class MakerStrategy:
         5. Optimize: Try to be Best Bid if it's "cheap enough", otherwise just sit at our max value.
         """
         
-        # Simple approach: Bid what we are willing to pay
-        # We want Bid_YES + Bid_NO <= MAKER_MAX_BUNDLE_COST
-        
-        # Use market implied probability to weight the bids
-        p = market.implied_probability
-        
-        # Calculate raw target prices
-        raw_yes = MAKER_MAX_BUNDLE_COST * p
-        raw_no = MAKER_MAX_BUNDLE_COST * (1 - p)
-        
-        # Round to tick (floor to be safe on cost)
-        bid_yes = int(raw_yes * 100) / 100.0
-        bid_no = int(raw_no * 100) / 100.0
+        # External price feed (Binance). If unavailable, skip quoting.
+        ref_price = self.binance_feed.get_price(asset_label) if self.binance_feed else None
+        if not ref_price:
+            return 0.0, 0.0
+
+        strike = market.strike_price or ref_price  # strike at discovery or fallback to ref
+        t_years = get_time_to_expiry(market.end_date_iso)
+        # Compute fair probability from external price
+        fair_prob = calculate_fair_probability(ref_price, strike, t_years, volatility=MAKER_VOL)
+
+        # Add maker edge: quote inside fair by MIN_SPREAD
+        bid_yes = max(0.0, round(fair_prob - MAKER_MIN_SPREAD, 2))
+        bid_no = max(0.0, round((1.0 - fair_prob) - MAKER_MIN_SPREAD, 2))
         
         # Safety checks
         if bid_yes <= 0.01: bid_yes = 0.0
@@ -226,7 +236,7 @@ class MakerStrategy:
     async def manage_orders(self):
         """Place or update orders (batched, with replace-on-delta and simple inventory skew)"""
         for label, market in self.markets.items():
-            target_yes, target_no = self.calculate_my_bids(market)
+            target_yes, target_no = self.calculate_my_bids(market, label)
 
             # Simple inventory skew: if long YES, shade YES down and NO up; vice versa
             pos_yes = self.position.get(label, {}).get('YES', 0.0)
@@ -264,7 +274,10 @@ class MakerStrategy:
                 await self.cancel_all_orders(tokens_to_cancel)
 
             if orders_to_place:
-                print(f"[Maker] 💸 {label}: Bids YES@{target_yes:.2f}, NO@{target_no:.2f} (Sum: {target_yes+target_no:.2f})")
+                fair = "n/a"
+                if target_yes > 0 or target_no > 0:
+                    fair = f"{target_yes+target_no:.2f}"
+                print(f"[Maker] 💸 {label}: Bids YES@{target_yes:.2f}, NO@{target_no:.2f} (Sum: {fair})")
                 try:
                     # Batch create and post
                     created = [self.clob_client.create_order(o) for o in orders_to_place]
@@ -286,20 +299,25 @@ class MakerStrategy:
     async def run(self):
         self.init_client()
         warm_connections()
+        # Start Binance feed
+        self.binance_feed = BinanceFeed()
+        feed_task = asyncio.create_task(self.binance_feed.start())
+
         await self.discover_markets()
         
         if not self.markets:
             print("[Maker] ❌ No markets to trade. Exiting.")
+            self.binance_feed.stop()
+            feed_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await feed_task
             return
-
+        
         print(f"[Maker] 🤖 Starting Maker Loop (Max Bundle Cost: ${MAKER_MAX_BUNDLE_COST})")
         print(f"[Maker]    Order Size: {MAKER_ORDER_SIZE} shares")
         
         try:
             while self.running:
-                # 1. Cancel everything (fresh start every cycle - brute force but safe)
-                await self.cancel_all_orders()
-                
                 # 2. Get latest prices
                 await self.update_market_books()
                 
@@ -312,7 +330,12 @@ class MakerStrategy:
         except KeyboardInterrupt:
             print("\n[Maker] 🛑 Stopping...")
         finally:
-            await self.cancel_all_orders()
+            await self.cancel_all_orders(list(self.last_quotes.keys()))
+            if self.binance_feed:
+                self.binance_feed.stop()
+            feed_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await feed_task
             print("[Maker] 👋 Shutdown complete.")
 
 if __name__ == "__main__":
