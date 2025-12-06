@@ -31,10 +31,8 @@ Run the following commands from your local terminal (replace `your-key.pem` and 
 chmod 400 path/to/your-key.pem
 
 # 2. Copy files to the server
-scp -i /Users/dardanberisha/polymarket-gabagool-bot/poly-bot.pem -r . ubuntu@98.86.148.148:~/POLYbot
+rsync -av --exclude 'venv' --exclude '__pycache__' --exclude '.git' -e "ssh -i /Users/dardanberisha/polymarket-gabagool-bot/poly-bot.pem" . ubuntu@98.86.148.148:~/polymarket-bot
 ```
-
-*Note: You can exclude `venv` and `__pycache__` to speed up upload.*
 
 ## Step 4: Setup Server
 
@@ -47,7 +45,7 @@ ssh -i /Users/dardanberisha/polymarket-gabagool-bot/poly-bot.pem ubuntu@98.86.14
 Run the setup commands (copy-paste block):
 
 ```bash
-cd ~/POLYbot
+cd ~/polymarket-bot
 
 # Update system
 sudo apt update && sudo apt upgrade -y
@@ -59,18 +57,18 @@ source venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
-
-# Verify setup
-python3 check_now.py
 ```
 
-## Step 5: Run the Bot
+## Step 5: Run the Bots
 
-Use `screen` to keep the bot running even after you disconnect.
+Use `screen` to keep the bots running even after you disconnect.
+
+### Option A: Run the Market Hopper (Taker Bot)
+Best for sniping existing opportunities.
 
 ```bash
 # Start a new screen session
-screen -S bot
+screen -S hopper
 
 # Activate venv (if not active)
 source venv/bin/activate
@@ -81,9 +79,27 @@ python3 main_hopper.py
 # To detach (keep running in background): Press Ctrl+A, then D
 ```
 
+### Option B: Run the Market Maker (Liquidity Provider)
+Best for capturing spread in illiquid markets (Gabagool Style).
+
+```bash
+# Start a new screen session (or detach the other one first)
+screen -S maker
+
+# Activate venv
+source venv/bin/activate
+
+# Run the maker script
+./run_maker.sh
+
+# To detach: Press Ctrl+A, then D
+```
+
 To resume looking at the logs later:
 ```bash
-screen -r bot
+screen -r hopper
+# or
+screen -r maker
 ```
 
 ## Step 6: Troubleshooting
@@ -95,4 +111,3 @@ screen -r bot
 
 *   **Bot crashes?**
     *   Check logs in `data/hopper_logs/`.
-

@@ -1,0 +1,285 @@
+import asyncio
+import os
+import time
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from dotenv import load_dotenv
+
+from py_clob_client.client import ClobClient
+from py_clob_client.constants import POLYGON
+from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY
+
+from config import (
+    PRIVATE_KEY, POLYGON_ADDRESS,
+    BTC_SLUG_PREFIX, ETH_SLUG_PREFIX,
+    WS_URL,
+    CHAIN_ID,
+    RPC_URL
+)
+from utils import get_target_markets, warm_connections, get_http_session
+
+# Load env so MAKER_* are populated
+load_dotenv()
+
+# --- MAKER CONFIGURATION ---
+MAKER_MAX_BUNDLE_COST = float(os.getenv("MAKER_MAX_BUNDLE_COST", "0.99"))  # Max combined cost we are willing to pay
+MAKER_ORDER_SIZE = float(os.getenv("MAKER_ORDER_SIZE", "50.0"))          # Size of our limit orders
+MAKER_MIN_SPREAD = float(os.getenv("MAKER_MIN_SPREAD", "0.01"))          # Min spread we want to capture
+MAKER_TICK_SIZE = 0.01                                                   # Polymarket tick size
+MAKER_REFRESH_INTERVAL = 2.0                                             # How often to re-evaluate orders (seconds)
+MAKER_PRICE_DELTA = float(os.getenv("MAKER_PRICE_DELTA", "0.01"))        # Move/cancel threshold
+
+@dataclass
+class MarketData:
+    slug: str
+    condition_id: str
+    yes_token: str
+    no_token: str
+    best_bid_yes: float = 0.0
+    best_ask_yes: float = 0.0
+    best_bid_no: float = 0.0
+    best_ask_no: float = 0.0
+    
+    @property
+    def mid_price_yes(self) -> float:
+        if self.best_bid_yes > 0 and self.best_ask_yes < 1:
+            return (self.best_bid_yes + self.best_ask_yes) / 2
+        return 0.5
+        
+    @property
+    def implied_probability(self) -> float:
+        # Estimate true probability from both sides
+        # P_yes + P_no = 1
+        # Mid_yes / (Mid_yes + Mid_no)
+        mid_yes = self.mid_price_yes
+        mid_no = (self.best_bid_no + self.best_ask_no) / 2 if (self.best_bid_no > 0 and self.best_ask_no < 1) else 0.5
+        total = mid_yes + mid_no
+        if total == 0: return 0.5
+        return mid_yes / total
+
+class MakerStrategy:
+    def __init__(self):
+        self.clob_client: Optional[ClobClient] = None
+        self.markets: Dict[str, MarketData] = {}  # 'BTC', 'ETH' -> MarketData
+        self.open_orders: Dict[str, List[str]] = {} # token_id -> list of order_ids
+        self.running = True
+
+    def init_client(self):
+        print("[Maker] 🔐 Initializing CLOB client...")
+        self.clob_client = ClobClient(
+            "https://clob.polymarket.com",
+            key=PRIVATE_KEY,
+            chain_id=POLYGON,
+            funder=POLYGON_ADDRESS,
+            signature_type=2,
+        )
+        creds = self.clob_client.create_or_derive_api_creds()
+        self.clob_client.set_api_creds(creds)
+        print(f"[Maker] ✅ Authenticated (Addr: {POLYGON_ADDRESS})")
+
+    async def discover_markets(self):
+        print("[Maker] 🔍 Discovering 15m markets...")
+        self.markets = {}
+        
+        for label, prefix in [('BTC', BTC_SLUG_PREFIX), ('ETH', ETH_SLUG_PREFIX)]:
+            found = get_target_markets(slug_prefix=prefix, asset_label=label)
+            if not found:
+                print(f"[Maker] ⚠️ No {label} market found.")
+                continue
+                
+            m = found[0]
+            print(f"[Maker] ✅ Found {label}: {m.get('question')}")
+            
+            # Get Token IDs and ensure market is tradable on CLOB
+            try:
+                c_id = m.get('condition_id')
+                market_resp = self.clob_client.get_market(c_id)
+                accepting = market_resp.get('accepting_orders') if isinstance(market_resp, dict) else getattr(market_resp, 'accepting_orders', None)
+                closed = market_resp.get('closed') if isinstance(market_resp, dict) else getattr(market_resp, 'closed', None)
+                if accepting is False or closed is True:
+                    print(f\"[Maker] ❌ {label} market not accepting orders or closed\")
+                    continue
+                tokens = market_resp.get('tokens', []) if isinstance(market_resp, dict) else market_resp.tokens
+                
+                yes_id = ""
+                no_id = ""
+                for t in tokens:
+                    outcome = (t.get('outcome') or t.get('label') or "").upper()
+                    tid = t.get('token_id')
+                    if outcome in ['YES', 'UP']: yes_id = tid
+                    elif outcome in ['NO', 'DOWN']: no_id = tid
+                
+                if yes_id and no_id:
+                    self.markets[label] = MarketData(
+                        slug=m.get('market_slug'),
+                        condition_id=c_id,
+                        yes_token=yes_id,
+                        no_token=no_id
+                    )
+                    print(f"[Maker]    Tokens: YES={yes_id[:10]}... NO={no_id[:10]}...")
+                else:
+                    print(f"[Maker] ❌ Could not identify tokens for {label}")
+                    
+            except Exception as e:
+                print(f"[Maker] ❌ Error fetching details for {label}: {e}")
+
+    async def cancel_all_orders(self, token_ids: List[str]):
+        """Cancel open orders for provided token_ids."""
+        if not token_ids:
+            return
+        try:
+            for tid in token_ids:
+                self.clob_client.cancel_orders(token_id=tid)
+            for tid in token_ids:
+                self.open_orders.pop(tid, None)
+        except Exception as e:
+            print(f"[Maker] ⚠️ Error cancelling orders: {e}")
+
+    async def update_market_books(self):
+        """Fetch latest orderbook depth"""
+        for label, market in self.markets.items():
+            try:
+                yes_book = self.clob_client.get_order_book(market.yes_token)
+                no_book = self.clob_client.get_order_book(market.no_token)
+                
+                market.best_bid_yes = float(yes_book.bids[0].price) if yes_book.bids else 0.0
+                market.best_ask_yes = float(yes_book.asks[0].price) if yes_book.asks else 1.0
+                market.best_bid_no = float(no_book.bids[0].price) if no_book.bids else 0.0
+                market.best_ask_no = float(no_book.asks[0].price) if no_book.asks else 1.0
+                
+                print(f"[Maker] {label} Book: YES {market.best_bid_yes:.2f}/{market.best_ask_yes:.2f} | NO {market.best_bid_no:.2f}/{market.best_ask_no:.2f} (ImpProb: {market.implied_probability:.2f})")
+            except Exception as e:
+                print(f"[Maker] ⚠️ Error updating book for {label}: {e}")
+
+    def calculate_my_bids(self, market: MarketData) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Calculate optimal bid prices.
+        Strategy:
+        1. Determine fair probability (P).
+        2. Distribute MAKER_MAX_BUNDLE_COST according to P.
+        3. Round down to tick size.
+        4. Ensure we are not crossing the spread (taking liquidity) unless intended (here we are Makers).
+        5. Optimize: Try to be Best Bid if it's "cheap enough", otherwise just sit at our max value.
+        """
+        
+        # Simple approach: Bid what we are willing to pay
+        # We want Bid_YES + Bid_NO <= MAKER_MAX_BUNDLE_COST
+        
+        # Use market implied probability to weight the bids
+        p = market.implied_probability
+        
+        # Calculate raw target prices
+        raw_yes = MAKER_MAX_BUNDLE_COST * p
+        raw_no = MAKER_MAX_BUNDLE_COST * (1 - p)
+        
+        # Round to tick (floor to be safe on cost)
+        bid_yes = int(raw_yes * 100) / 100.0
+        bid_no = int(raw_no * 100) / 100.0
+        
+        # Safety checks
+        if bid_yes <= 0.01: bid_yes = 0.0
+        if bid_no <= 0.01: bid_no = 0.0
+        if bid_yes >= 0.99: bid_yes = 0.0 # Too risky
+        if bid_no >= 0.99: bid_no = 0.0
+        
+        # Keep bids on the passive side and respect min spread
+        if market.best_bid_yes and bid_yes > market.best_bid_yes:
+            bid_yes = max(market.best_bid_yes, bid_yes - MAKER_TICK_SIZE)
+        if market.best_bid_no and bid_no > market.best_bid_no:
+            bid_no = max(market.best_bid_no, bid_no - MAKER_TICK_SIZE)
+        
+        # If spread is tight, step back a tick
+        if (market.best_ask_yes - market.best_bid_yes) < MAKER_MIN_SPREAD:
+            bid_yes = max(0.0, min(bid_yes, market.best_bid_yes - MAKER_TICK_SIZE))
+        if (market.best_ask_no - market.best_bid_no) < MAKER_MIN_SPREAD:
+            bid_no = max(0.0, min(bid_no, market.best_bid_no - MAKER_TICK_SIZE))
+        
+        # Final bundle safety: don't exceed max bundle with current best asks
+        if (bid_yes + bid_no) > MAKER_MAX_BUNDLE_COST:
+            scale = MAKER_MAX_BUNDLE_COST / max(0.01, bid_yes + bid_no)
+            bid_yes = round(bid_yes * scale, 2)
+            bid_no = round(bid_no * scale, 2)
+        
+        return bid_yes, bid_no
+
+    async def manage_orders(self):
+        """Place or update orders"""
+        for label, market in self.markets.items():
+            target_yes, target_no = self.calculate_my_bids(market)
+            
+            # Cancel existing orders for this market only if prices moved materially
+            token_ids = []
+            if target_yes > 0:
+                token_ids.append(market.yes_token)
+            if target_no > 0:
+                token_ids.append(market.no_token)
+            
+            await self.cancel_all_orders(token_ids)
+            
+            orders_to_place = []
+            
+            if target_yes > 0:
+                orders_to_place.append(OrderArgs(
+                    price=target_yes,
+                    size=MAKER_ORDER_SIZE,
+                    side=BUY,
+                    token_id=market.yes_token
+                ))
+            
+            if target_no > 0:
+                orders_to_place.append(OrderArgs(
+                    price=target_no,
+                    size=MAKER_ORDER_SIZE,
+                    side=BUY,
+                    token_id=market.no_token
+                ))
+                
+            if orders_to_place:
+                print(f"[Maker] 💸 {label}: Placing bids YES@{target_yes:.2f}, NO@{target_no:.2f} (Sum: {target_yes+target_no:.2f})")
+                try:
+                    for order in orders_to_place:
+                        o = self.clob_client.create_order(order)
+                        self.clob_client.post_order(o, OrderType.GTC)
+                except Exception as e:
+                    print(f"[Maker] ⚠️ Order placement failed: {e}")
+            else:
+                print(f"[Maker] 💤 {label}: No valid bids calculated (targets too low?)")
+
+    async def run(self):
+        self.init_client()
+        warm_connections()
+        await self.discover_markets()
+        
+        if not self.markets:
+            print("[Maker] ❌ No markets to trade. Exiting.")
+            return
+
+        print(f"[Maker] 🤖 Starting Maker Loop (Max Bundle Cost: ${MAKER_MAX_BUNDLE_COST})")
+        print(f"[Maker]    Order Size: {MAKER_ORDER_SIZE} shares")
+        
+        try:
+            while self.running:
+                # 1. Cancel everything (fresh start every cycle - brute force but safe)
+                await self.cancel_all_orders()
+                
+                # 2. Get latest prices
+                await self.update_market_books()
+                
+                # 3. Place new orders
+                await self.manage_orders()
+                
+                # 4. Sleep
+                await asyncio.sleep(MAKER_REFRESH_INTERVAL)
+                
+        except KeyboardInterrupt:
+            print("\n[Maker] 🛑 Stopping...")
+        finally:
+            await self.cancel_all_orders()
+            print("[Maker] 👋 Shutdown complete.")
+
+if __name__ == "__main__":
+    # Simple event loop
+    strategy = MakerStrategy()
+    asyncio.run(strategy.run())
+
