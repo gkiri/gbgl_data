@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import aiohttp
 from contextlib import suppress
 
@@ -215,6 +215,8 @@ class MarketHopper:
         self.ws_connected: bool = False
         self.last_resolution_check: Dict[str, float] = {}
         self.last_resolution_poll: float = 0.0
+        self.last_market_refresh: float = 0.0
+        self.needs_refresh: bool = False
         
         # Session tracking
         self.session_start: float = time.time()
@@ -425,6 +427,13 @@ class MarketHopper:
     async def initialize_markets(self):
         """Discover and initialize both BTC and ETH markets"""
         print("[Hopper] 🔍 Discovering markets...")
+        # Clock sanity: print UTC and Zagreb time for debugging window alignment
+        now_utc = datetime.now(timezone.utc)
+        try:
+            zagreb = now_utc.astimezone(timezone(timedelta(hours=1)))
+            print(f"[Hopper] 🕒 Clock check: UTC {now_utc.isoformat()} | Zagreb {zagreb.isoformat()}")
+        except Exception:
+            print(f"[Hopper] 🕒 Clock check (UTC): {now_utc.isoformat()}")
         
         # Initialize CLOB client (only once)
         if not self.clob_client:
@@ -759,6 +768,7 @@ class MarketHopper:
                 err_str = str(e)
                 if "404" in err_str:
                     print(f"[Hopper] 🔴 {label} Token not found - need market refresh")
+                    self.needs_refresh = True
                 else:
                     print(f"[Hopper] ⚠️ {label} poll error: {e}")
     
@@ -818,6 +828,24 @@ class MarketHopper:
                     await self.poll_market_data()
                     self.decide_focus()
                     print("[Hopper] ✅ Markets refreshed for new window")
+                    self.last_market_refresh = time.time()
+                    self.needs_refresh = False
+                    continue
+                
+                # Periodic refresh / rediscovery guard
+                now = time.time()
+                refresh_interval = 180  # 3 minutes
+                if self.needs_refresh or (now - self.last_market_refresh > refresh_interval):
+                    # Check for stale/degenerate markets
+                    if any(self._market_needs_redisco(m) for m in self.markets.values()):
+                        print("[Hopper] 🔄 Refreshing markets due to stale/degenerate book or timer...")
+                        await asyncio.sleep(2)
+                        await self.initialize_markets()
+                        await self.poll_market_data()
+                        self.decide_focus()
+                        self.last_market_refresh = time.time()
+                        self.needs_refresh = False
+                        continue
                 
                 # Poll market data
                 if (not self.ws_connected) or self._is_book_stale(self.current_focus, stale_after=1.0):
@@ -884,6 +912,30 @@ class MarketHopper:
             except Exception as e:
                 print(f"[Hopper] ⚠️ Failed to parse end_date for {label}: {e}")
         
+        return False
+
+    def _market_needs_redisco(self, market: MarketState) -> bool:
+        """
+        Detect stale/invalid markets needing rediscovery:
+        - Expired window (end_date <= now)
+        - Degenerate book shape (0 bid, ~1 ask on both sides)
+        """
+        now = datetime.now(timezone.utc)
+        # Expired
+        if market.end_date_iso:
+            try:
+                end_str = market.end_date_iso.replace('Z', '+00:00')
+                end_time = datetime.fromisoformat(end_str)
+                if end_time <= now:
+                    return True
+            except Exception:
+                pass
+        # Degenerate book
+        if (
+            market.best_bid_yes == 0 and market.best_bid_no == 0 and
+            market.best_ask_yes >= 0.99 and market.best_ask_no >= 0.99
+        ):
+            return True
         return False
     
     def _log_market_state(self):
