@@ -21,8 +21,12 @@ References:
 
 import asyncio
 import time
+import json
+import threading
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timezone
 from collections import deque
 from datetime import datetime, timezone
 
@@ -259,6 +263,34 @@ class Position:
         self.no_avg_price = self.no_cost / self.no_shares if self.no_shares > 0 else 0
         
         return realized
+
+
+class BundleJsonLogger:
+    """
+    Lightweight JSONL logger for bundle arbitrage events.
+    Writes to data/bundle_logs/bundle_session_<ts>.jsonl
+    """
+
+    def __init__(self, log_dir: str = "data/bundle_logs"):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.session_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        self.session_file = self.log_dir / f"bundle_session_{self.session_id}.jsonl"
+        self._lock = threading.Lock()
+        # Session start marker
+        self.log({"event_type": "session_start"})
+
+    def log(self, record: Dict):
+        rec = record.copy()
+        rec.setdefault("ts", int(time.time()))
+        rec.setdefault("session_id", self.session_id)
+        try:
+            with self._lock:
+                with open(self.session_file, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+        except Exception as e:
+            # Don't raise from logger; just print for visibility
+            print(f"[BundleLog] write error: {e}")
 
 
 # =============================================================================
@@ -686,6 +718,38 @@ class DualSideSweeper:
                 
                 # Update position
                 position.update_from_fill(side, price, filled_size)
+                
+                # Log per-fill event
+                token_for_log = yes_token if side == 'YES' else no_token
+                self.logger.log_order_placed(
+                    market_slug=market_slug,
+                    condition_id=condition_id,
+                    token_id=token_for_log,
+                    outcome='Up' if side == 'YES' else 'Down',
+                    side='BUY',
+                    price=price,
+                    size=float(filled_size),
+                    order_id=order_id or "unknown",
+                    status=status,
+                    market_context={'bundle_arbitrage': True, 'multi_fill': True},
+                )
+                self.logger.update_position_from_fill('Up' if side == 'YES' else 'Down', 'BUY', price, float(filled_size))
+                # JSON event log for analysis
+                self.event_logger.log({
+                    "event_type": "fill",
+                    "market_slug": market_slug,
+                    "condition_id": condition_id,
+                    "side": side,
+                    "price": price,
+                    "size": float(filled_size),
+                    "order_id": order_id,
+                    "position": {
+                        "yes_shares": position.yes_shares,
+                        "no_shares": position.no_shares,
+                        "bundle_cost": position.bundle_cost,
+                        "imbalance": position.imbalance,
+                    },
+                })
         
         # Track fills per sweep for analysis
         total_fills = yes_fills_count + no_fills_count
@@ -730,6 +794,7 @@ class BundleArbitrageur:
         
         # Logging
         self.logger = TradeLogger(log_dir="data/bundle_logs")
+        self.event_logger = BundleJsonLogger(log_dir="data/bundle_logs")
         
         # Market state
         self.yes_token: str = ""
@@ -820,6 +885,22 @@ class BundleArbitrageur:
         
         # EXECUTE SWEEP!
         print(f"[BundleArb] 🎯 SWEEP! Bundle=${book.bundle_cost_ask:.3f} (YES=${book.best_ask_yes:.3f} NO=${book.best_ask_no:.3f})")
+        # Log sweep attempt with current state
+        self.event_logger.log({
+            "event_type": "sweep_attempt",
+            "market_slug": self.market_slug,
+            "condition_id": self.condition_id,
+            "bundle_cost": book.bundle_cost_ask,
+            "best_ask_yes": book.best_ask_yes,
+            "best_ask_no": book.best_ask_no,
+            "position": {
+                "yes_shares": self.position.yes_shares,
+                "no_shares": self.position.no_shares,
+                "bundle_cost": self.position.bundle_cost,
+                "imbalance": self.position.imbalance,
+            },
+            "reason": reason,
+        })
         
         yes_fills, no_fills, yes_vol, no_vol = await self.sweeper.sweep_both_sides(
             self.yes_token,
@@ -840,6 +921,24 @@ class BundleArbitrageur:
                 merged_profit = await self._settle_hedged_pairs()
                 if merged_profit > 0:
                     print(f"[BundleArb] 💰 AUTO-MERGE: +${merged_profit:.2f} realized")
+            
+            # Log sweep result
+            self.event_logger.log({
+                "event_type": "sweep_result",
+                "market_slug": self.market_slug,
+                "condition_id": self.condition_id,
+                "bundle_cost": book.bundle_cost_ask,
+                "yes_fills": yes_fills,
+                "no_fills": no_fills,
+                "yes_volume": yes_vol,
+                "no_volume": no_vol,
+                "position": {
+                    "yes_shares": self.position.yes_shares,
+                    "no_shares": self.position.no_shares,
+                    "bundle_cost": self.position.bundle_cost,
+                    "imbalance": self.position.imbalance,
+                },
+            })
             
             self._log_state(f"✅ Sweep #{self.sweeps_executed}: {yes_fills}Y/{no_fills}N fills, {yes_vol:.0f}/{no_vol:.0f} vol")
             return True
