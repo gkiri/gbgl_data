@@ -17,6 +17,8 @@ WS_URL = "wss://ws-live-data.polymarket.com"
 
 # --- MODES ---
 PAPER_TRADING = os.getenv("PAPER_TRADING", "false").lower() == "true"
+# Temporarily force paper trading off to exercise live-path logic
+PAPER_TRADING = False
 
 # --- POLYGON CHAIN ---
 CHAIN_ID = 137

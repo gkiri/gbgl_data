@@ -36,8 +36,11 @@ from py_clob_client.order_builder.constants import BUY
 from py_clob_client.constants import POLYGON
 
 from config import (
-    PRIVATE_KEY, POLYGON_ADDRESS,
-    ENABLE_ONCHAIN_MERGE, ENABLE_ONCHAIN_REDEEM,
+    PRIVATE_KEY,
+    POLYGON_ADDRESS,
+    SIGNATURE_TYPE,
+    ENABLE_ONCHAIN_MERGE,
+    ENABLE_ONCHAIN_REDEEM,
 )
 from chain_client import CTFSettlementClient
 from trade_logger import TradeLogger
@@ -57,11 +60,12 @@ class BundleConfig:
     max_bundle_cost: float = 0.99       # Was 0.98, avg VWAP is 0.987
     target_bundle_cost: float = 0.985   # Was 0.97, realistic target
     abort_bundle_cost: float = 0.995    # Tighter - losses happen at >1.00
+    bid_bundle_threshold: float = 0.995 # Trigger on bid_sum for bursts (cheap bundle)
     
     # Position Balance (winners avg 7.6% imbalance, losers 28.3%)
     max_imbalance: float = 0.10         # Max 10% difference between YES/NO
     min_position_size: float = 100      # Don't bother with tiny positions
-    max_total_exposure: float = 2000    # Max total capital at risk
+    max_total_exposure: float = 50      # Max total capital at risk (kept tiny for tests)
     
     # Entry Price Thresholds (WIDENED based on actual price ranges)
     # Gabagool22 buys Up $0.09-$0.91, Down $0.11-$0.89
@@ -69,15 +73,21 @@ class BundleConfig:
     max_yes_price: float = 0.99
     max_no_price: float = 0.99
     cheap_side_threshold: float = 1.00  # effectively disabled; bundle cap governs entry
+    cheap_yes_bid: float = 0.45         # one-sided cheapness (bid) trigger
+    cheap_no_bid: float = 0.45          # one-sided cheapness (bid) trigger
     
     # Execution (avg 16.8 fills per transaction - AGGRESSIVE multi-fill)
-    order_size: float = 16              # Confirmed 16 shares standard
-    sweep_burst_size: int = 20          # Was 50, per-burst wave
+    order_size: float = 5               # Legacy single clip (fallback)
+    clip_ladder: Tuple[float, ...] = (3, 4, 5)  # bursty fixed clips, tiny
+    burst_child_count: int = 1          # orders per trigger (pairs or singles)
+    sweep_burst_size: int = 2           # per-second rate cap
     sweep_interval_ms: float = 5        # Was 10ms, faster execution
     min_order_value: float = 1.0        # Minimum $1 order value
-    fills_per_sweep: int = 17           # Target ~16.8 fills (from VWAP analysis)
-    merge_min_hedged: float = 500       # Minimum hedged shares before on-chain merge
-    merge_min_unrealized: float = 10.0  # Minimum unrealized PnL ($) before on-chain merge
+    fills_per_sweep: int = 2            # tiny burst, for testing
+    spread_min: float = 0.01            # require enough spread (avoid micro-spread noise)
+    depth_min: float = 5.0              # min depth at touch per leg (shares)
+    merge_min_hedged: float = 20        # Minimum hedged shares before on-chain merge (lowered for tiny tests)
+    merge_min_unrealized: float = 1.0   # Minimum unrealized PnL ($) before on-chain merge
     
     # Time-based scoring (early morning has better arbitrage)
     morning_bonus_start: int = 9        # UTC hour
@@ -374,28 +384,8 @@ class BundleCostCalculator:
         Determine if we should enter a position.
         Returns (should_enter, reason)
         """
-        if not self.current:
-            return False, "No market data"
-        
-        bc = self.current.bundle_cost_ask
-        
-        if bc >= self.config.abort_bundle_cost:
-            return False, f"Bundle cost ${bc:.3f} >= abort threshold ${self.config.abort_bundle_cost}"
-        
-        if bc >= self.config.max_bundle_cost:
-            return False, f"Bundle cost ${bc:.3f} >= max ${self.config.max_bundle_cost}"
-        
-        if not self.current.has_liquidity:
-            return False, "No liquidity"
-        
-        # Check individual price thresholds (kept as sanity bounds)
-        if self.current.best_ask_yes > self.config.max_yes_price:
-            return False, f"YES ask ${self.current.best_ask_yes:.3f} > max ${self.config.max_yes_price}"
-        
-        if self.current.best_ask_no > self.config.max_no_price:
-            return False, f"NO ask ${self.current.best_ask_no:.3f} > max ${self.config.max_no_price}"
-        
-        return True, f"Bundle cost ${bc:.3f} - OPPORTUNITY!"
+        action, reason = self.get_trigger_action()
+        return action is not None, reason
     
     def should_abort(self) -> Tuple[bool, str]:
         """Check if we should stop accumulating"""
@@ -407,6 +397,44 @@ class BundleCostCalculator:
             return True, f"Bundle cost ${bc:.3f} >= abort ${self.config.abort_bundle_cost}"
         
         return False, ""
+
+    def get_trigger_action(self) -> Tuple[Optional[str], str]:
+        """
+        Determine which trigger fired.
+        Returns (action, reason) where action in { 'bundle', 'cheap_yes', 'cheap_no', None }
+        """
+        if not self.current:
+            return None, "No market data"
+        
+        book = self.current
+        bc_bid = book.bundle_cost_bid
+        spread_ok = (
+            book.spread_yes >= self.config.spread_min
+            and book.spread_no >= self.config.spread_min
+        )
+        depth_yes = min(book.best_bid_yes_size, book.best_ask_yes_size)
+        depth_no = min(book.best_bid_no_size, book.best_ask_no_size)
+        depth_ok = (depth_yes >= self.config.depth_min) and (depth_no >= self.config.depth_min)
+        
+        if not spread_ok:
+            return None, "Spread too tight for burst entry"
+        if not depth_ok:
+            return None, "Depth too thin at touch"
+        if book.best_ask_yes > self.config.max_yes_price:
+            return None, f"YES ask ${book.best_ask_yes:.3f} > max ${self.config.max_yes_price}"
+        if book.best_ask_no > self.config.max_no_price:
+            return None, f"NO ask ${book.best_ask_no:.3f} > max ${self.config.max_no_price}"
+        
+        if bc_bid < self.config.bid_bundle_threshold:
+            return "bundle", f"Bid bundle ${bc_bid:.3f} < ${self.config.bid_bundle_threshold}"
+        
+        if book.best_bid_yes < self.config.cheap_yes_bid:
+            return "cheap_yes", f"Cheap YES bid ${book.best_bid_yes:.3f}"
+        
+        if book.best_bid_no < self.config.cheap_no_bid:
+            return "cheap_no", f"Cheap NO bid ${book.best_bid_no:.3f}"
+        
+        return None, f"No trigger (bid bundle ${bc_bid:.3f})"
 
 
 # =============================================================================
@@ -516,6 +544,20 @@ class DualSideSweeper:
         
         # Multi-fill tracking
         self.sweep_fill_counts: List[int] = []  # Track fills per sweep
+    
+    @staticmethod
+    def _safe_min(values: List[float]) -> float:
+        vals = [v for v in values if v is not None and v > 0]
+        return min(vals) if vals else 0.0
+    
+    def _select_clip(self, ladder: Tuple[float, ...], *depths: float) -> float:
+        """Pick the largest clip that fits available depth (2x clip) and depth_min."""
+        avail = self._safe_min(list(depths))
+        for size in sorted(ladder, reverse=True):
+            if avail >= max(self.config.depth_min, size * 2):
+                return size
+        # fallback to smallest clip
+        return sorted(ladder)[0] if ladder else self.config.order_size
     
     def _can_place_order(self) -> bool:
         """Check burst rate limits"""
@@ -639,51 +681,28 @@ class DualSideSweeper:
         if yes_price > self.config.max_yes_price or no_price > self.config.max_no_price:
             return 0, 0, 0.0, 0.0
         
-        # Multi-fill execution: target ~17 fills per sweep
-        # Split total order size across multiple smaller orders
-        target_fills = self.config.fills_per_sweep  # 17
-        order_size = self.config.order_size  # 16 shares
-        
-        # Calculate size per fill to achieve ~17 fills while maintaining volume
-        size_per_order = max(1, order_size)  # Match observed 16-share clips
-        
-        # Get balanced sizes based on current position
+        # Clip selection from ladder based on depth
+        clip_size = self._select_clip(self.config.clip_ladder, book.best_ask_yes_size, book.best_ask_no_size)
         base_yes, base_no = balancer.get_balanced_order_sizes(
-            position, book, size_per_order
+            position, book, clip_size
         )
         
-        # Build paired order list to reduce leg risk (YES+NO together)
+        target_pairs = max(1, self.config.burst_child_count)
+        # Scale down if nearing exposure cap
+        pair_notional = (yes_price + no_price) * min(base_yes, base_no)
+        remaining_exposure = max(0.0, self.config.max_total_exposure - position.total_exposure)
+        if pair_notional > 0:
+            max_pairs_by_cap = max(1, int(remaining_exposure // pair_notional))
+            target_pairs = min(target_pairs, max_pairs_by_cap)
         orders_to_place = []
-        
-        yes_count = 0
-        no_count = 0
-        max_per_side = target_fills // 2 + 1
-        yes_top_liquidity = book.best_ask_yes_size if book.best_ask_yes_size > 0 else float("inf")
-        no_top_liquidity = book.best_ask_no_size if book.best_ask_no_size > 0 else float("inf")
-        yes_limit = max_per_side if yes_top_liquidity == float("inf") else int(yes_top_liquidity // base_yes)
-        no_limit = max_per_side if no_top_liquidity == float("inf") else int(no_top_liquidity // base_no)
-        yes_limit = max(0, min(max_per_side, yes_limit))
-        no_limit = max(0, min(max_per_side, no_limit))
-        pair_limit = min(target_fills // 2, yes_limit, no_limit)
-        if pair_limit <= 0:
-            return 0, 0, 0.0, 0.0
-        
         start_side = 'NO' if position.yes_shares > position.no_shares else 'YES'
-        for i in range(pair_limit):
+        for _ in range(target_pairs):
             if start_side == 'YES':
-                if yes_count < yes_limit:
-                    orders_to_place.append(('YES', yes_price, base_yes))
-                    yes_count += 1
-                if no_count < no_limit:
-                    orders_to_place.append(('NO', no_price, base_no))
-                    no_count += 1
+                orders_to_place.append(('YES', yes_price, base_yes))
+                orders_to_place.append(('NO', no_price, base_no))
             else:
-                if no_count < no_limit:
-                    orders_to_place.append(('NO', no_price, base_no))
-                    no_count += 1
-                if yes_count < yes_limit:
-                    orders_to_place.append(('YES', yes_price, base_yes))
-                    yes_count += 1
+                orders_to_place.append(('NO', no_price, base_no))
+                orders_to_place.append(('YES', yes_price, base_yes))
         
         # Execute all orders concurrently for speed
         async def _execute_order(side, price, size):
@@ -761,6 +780,71 @@ class DualSideSweeper:
         
         return yes_fills_count, no_fills_count, yes_volume, no_volume
 
+    async def sweep_one_side(
+        self,
+        side: str,
+        yes_token: str,
+        no_token: str,
+        book: OrderBookState,
+        position: Position,
+        market_slug: str = "",
+        condition_id: str = "",
+    ) -> Tuple[int, int, float, float]:
+        """
+        Burst orders on a single side (cheap-side tap).
+        Returns (yes_fills, no_fills, yes_volume, no_volume)
+        """
+        token_id = yes_token if side == "YES" else no_token
+        price = book.best_ask_yes if side == "YES" else book.best_ask_no
+        depth_side = book.best_ask_yes_size if side == "YES" else book.best_ask_no_size
+        if price <= 0 or depth_side <= 0:
+            return 0, 0, 0.0, 0.0
+        
+        clip_size = self._select_clip(self.config.clip_ladder, depth_side)
+        remaining_exposure = max(0.0, self.config.max_total_exposure - position.total_exposure)
+        max_orders_by_cap = max(1, int(remaining_exposure // (price * clip_size)) if price * clip_size > 0 else 1)
+        target_orders = min(max(1, self.config.burst_child_count), max_orders_by_cap)
+        orders_to_place = [(side, price, clip_size)] * target_orders
+        
+        async def _execute(order_side, p, s):
+            return (order_side, await self.place_order(token_id, order_side, p, s, market_slug, condition_id))
+        
+        tasks = [_execute(side, price, clip_size) for _ in orders_to_place]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        yes_fills_count = 0
+        no_fills_count = 0
+        yes_volume = 0.0
+        no_volume = 0.0
+        
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            order_side, (order_id, status, filled_size) = result
+            if status == "matched" and filled_size > 0:
+                if order_side == "YES":
+                    yes_fills_count += 1
+                    yes_volume += filled_size
+                else:
+                    no_fills_count += 1
+                    no_volume += filled_size
+                position.update_from_fill(order_side, price, filled_size)
+                self.logger.log_order_placed(
+                    market_slug=market_slug,
+                    condition_id=condition_id,
+                    token_id=token_id,
+                    outcome='Up' if order_side == 'YES' else 'Down',
+                    side='BUY',
+                    price=price,
+                    size=float(filled_size),
+                    order_id=order_id or "unknown",
+                    status=status,
+                    market_context={'bundle_arbitrage': True, 'single_leg': True},
+                )
+                self.logger.update_position_from_fill('Up' if order_side == 'YES' else 'Down', 'BUY', price, float(filled_size))
+        
+        return yes_fills_count, no_fills_count, yes_volume, no_volume
+
 
 # =============================================================================
 # MAIN BUNDLE ARBITRAGEUR CLASS
@@ -818,7 +902,7 @@ class BundleArbitrageur:
             key=PRIVATE_KEY,
             chain_id=POLYGON,
             funder=POLYGON_ADDRESS,
-            signature_type=2,
+            signature_type=SIGNATURE_TYPE,
         )
         creds = self.clob_client.create_or_derive_api_creds()
         self.clob_client.set_api_creds(creds)
@@ -859,8 +943,9 @@ class BundleArbitrageur:
         if not book:
             return False
         
-        # Check if we should enter
-        should_enter, reason = self.calculator.should_enter()
+        # Check trigger (bundle or one-sided cheapness)
+        action, reason = self.calculator.get_trigger_action()
+        should_enter = action is not None
         
         # Also check abort condition
         should_abort, abort_reason = self.calculator.should_abort()
@@ -884,15 +969,18 @@ class BundleArbitrageur:
             return False
         
         # EXECUTE SWEEP!
-        print(f"[BundleArb] 🎯 SWEEP! Bundle=${book.bundle_cost_ask:.3f} (YES=${book.best_ask_yes:.3f} NO=${book.best_ask_no:.3f})")
+        print(f"[BundleArb] 🎯 SWEEP {action}! BidBundle=${book.bundle_cost_bid:.3f} AskBundle=${book.bundle_cost_ask:.3f}")
         # Log sweep attempt with current state
         self.event_logger.log({
             "event_type": "sweep_attempt",
             "market_slug": self.market_slug,
             "condition_id": self.condition_id,
             "bundle_cost": book.bundle_cost_ask,
+            "bundle_cost_bid": book.bundle_cost_bid,
             "best_ask_yes": book.best_ask_yes,
             "best_ask_no": book.best_ask_no,
+            "best_bid_yes": book.best_bid_yes,
+            "best_bid_no": book.best_bid_no,
             "position": {
                 "yes_shares": self.position.yes_shares,
                 "no_shares": self.position.no_shares,
@@ -900,17 +988,32 @@ class BundleArbitrageur:
                 "imbalance": self.position.imbalance,
             },
             "reason": reason,
+            "action": action,
         })
         
-        yes_fills, no_fills, yes_vol, no_vol = await self.sweeper.sweep_both_sides(
-            self.yes_token,
-            self.no_token,
-            book,
-            self.position,
-            self.balancer,
-            self.market_slug,
-            self.condition_id,
-        )
+        if action == "bundle":
+            yes_fills, no_fills, yes_vol, no_vol = await self.sweeper.sweep_both_sides(
+                self.yes_token,
+                self.no_token,
+                book,
+                self.position,
+                self.balancer,
+                self.market_slug,
+                self.condition_id,
+            )
+        elif action in ("cheap_yes", "cheap_no"):
+            side = "YES" if action == "cheap_yes" else "NO"
+            yes_fills, no_fills, yes_vol, no_vol = await self.sweeper.sweep_one_side(
+                side,
+                self.yes_token,
+                self.no_token,
+                book,
+                self.position,
+                self.market_slug,
+                self.condition_id,
+            )
+        else:
+            return False
         
         self.sweeps_executed += 1
         total_fills = yes_fills + no_fills

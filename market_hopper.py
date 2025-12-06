@@ -33,15 +33,34 @@ from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
 
 from config import (
-    PRIVATE_KEY, POLYGON_ADDRESS,
-    BTC_SLUG_PREFIX, ETH_SLUG_PREFIX,
+    PRIVATE_KEY,
+    POLYGON_ADDRESS,
+    SIGNATURE_TYPE,
+    BTC_SLUG_PREFIX,
+    ETH_SLUG_PREFIX,
     ENABLE_BUNDLE_ARBITRAGE,
-    BA_MAX_BUNDLE_COST, BA_TARGET_BUNDLE_COST, BA_ABORT_BUNDLE_COST,
-    BA_MAX_IMBALANCE, BA_MAX_TOTAL_EXPOSURE,
-    BA_MAX_YES_PRICE, BA_MAX_NO_PRICE, BA_CHEAP_SIDE_THRESHOLD,
-    BA_SWEEP_BURST_SIZE, BA_SWEEP_INTERVAL_MS, BA_ORDER_SIZE,
-    BA_MORNING_BONUS_START, BA_MORNING_BONUS_END, BA_MORNING_BONUS_MULT,
+    BA_MAX_BUNDLE_COST,
+    BA_TARGET_BUNDLE_COST,
+    BA_ABORT_BUNDLE_COST,
+    BA_MAX_IMBALANCE,
+    BA_MAX_TOTAL_EXPOSURE,
+    BA_MAX_YES_PRICE,
+    BA_MAX_NO_PRICE,
+    BA_CHEAP_SIDE_THRESHOLD,
+    BA_SWEEP_BURST_SIZE,
+    BA_SWEEP_INTERVAL_MS,
+    BA_ORDER_SIZE,
+    BA_MORNING_BONUS_START,
+    BA_MORNING_BONUS_END,
+    BA_MORNING_BONUS_MULT,
     BA_FILLS_PER_SWEEP,
+    BA_BID_BUNDLE_THRESHOLD,
+    BA_SPREAD_MIN,
+    BA_DEPTH_MIN,
+    BA_CHEAP_YES_BID,
+    BA_CHEAP_NO_BID,
+    BA_CLIP_LADDER,
+    BA_BURST_CHILD_COUNT,
     WS_URL,
     ENABLE_ONCHAIN_REDEEM,
 )
@@ -79,6 +98,9 @@ class MarketState:
     spread_yes: float = 1.0
     spread_no: float = 1.0
     bundle_cost: float = 2.0  # best_ask_yes + best_ask_no
+    bundle_cost_bid: float = 2.0  # best_bid_yes + best_bid_no
+    cheap_yes: bool = False
+    cheap_no: bool = False
     
     # Liquidity flag
     has_liquidity: bool = False
@@ -112,17 +134,26 @@ class MarketState:
         
         # Bundle cost for arbitrage calculation
         self.bundle_cost = ask_yes + ask_no
+        self.bundle_cost_bid = bid_yes + bid_no
         
         # Check liquidity
         yes_ok = 0.02 < ask_yes < 0.98
         no_ok = 0.02 < ask_no < 0.98
         self.has_liquidity = yes_ok or no_ok
         
-        # Check arbitrage opportunity (the key metric!)
-        cheap_side = min(self.best_ask_yes, self.best_ask_no)
+        # Cheap-side flags (bid-based)
+        self.cheap_yes = bid_yes < BA_CHEAP_YES_BID
+        self.cheap_no = bid_no < BA_CHEAP_NO_BID
+        
+        # Check arbitrage opportunity (bid-side + spread/depth guard)
+        depth_yes = min(self.best_bid_yes_size, self.best_ask_yes_size)
+        depth_no = min(self.best_bid_no_size, self.best_ask_no_size)
+        spread_ok = (self.spread_yes >= BA_SPREAD_MIN) and (self.spread_no >= BA_SPREAD_MIN)
+        depth_ok = depth_yes >= BA_DEPTH_MIN and depth_no >= BA_DEPTH_MIN
         self.has_arbitrage = (
-            self.bundle_cost < BA_MAX_BUNDLE_COST
-            and cheap_side <= BA_CHEAP_SIDE_THRESHOLD
+            self.bundle_cost_bid < BA_BID_BUNDLE_THRESHOLD
+            and spread_ok
+            and depth_ok
         )
     
     def to_orderbook_state(self) -> OrderBookState:
@@ -183,6 +214,7 @@ class MarketHopper:
         self.ws_task: Optional[asyncio.Task] = None
         self.ws_connected: bool = False
         self.last_resolution_check: Dict[str, float] = {}
+        self.last_resolution_poll: float = 0.0
         
         # Session tracking
         self.session_start: float = time.time()
@@ -198,7 +230,7 @@ class MarketHopper:
             key=PRIVATE_KEY,
             chain_id=POLYGON,
             funder=POLYGON_ADDRESS,
-            signature_type=2,
+            signature_type=SIGNATURE_TYPE,
         )
         creds = self.clob_client.create_or_derive_api_creds()
         self.clob_client.set_api_creds(creds)
@@ -209,15 +241,22 @@ class MarketHopper:
             max_bundle_cost=BA_MAX_BUNDLE_COST,
             target_bundle_cost=BA_TARGET_BUNDLE_COST,
             abort_bundle_cost=BA_ABORT_BUNDLE_COST,
+            bid_bundle_threshold=BA_BID_BUNDLE_THRESHOLD,
             max_imbalance=BA_MAX_IMBALANCE,
             max_total_exposure=BA_MAX_TOTAL_EXPOSURE,
             max_yes_price=BA_MAX_YES_PRICE,
             max_no_price=BA_MAX_NO_PRICE,
             cheap_side_threshold=BA_CHEAP_SIDE_THRESHOLD,
+            cheap_yes_bid=BA_CHEAP_YES_BID,
+            cheap_no_bid=BA_CHEAP_NO_BID,
             order_size=BA_ORDER_SIZE,
+            clip_ladder=BA_CLIP_LADDER,
+            burst_child_count=BA_BURST_CHILD_COUNT,
             sweep_burst_size=BA_SWEEP_BURST_SIZE,
             sweep_interval_ms=BA_SWEEP_INTERVAL_MS,
             fills_per_sweep=BA_FILLS_PER_SWEEP,
+            spread_min=BA_SPREAD_MIN,
+            depth_min=BA_DEPTH_MIN,
             morning_bonus_start=BA_MORNING_BONUS_START,
             morning_bonus_end=BA_MORNING_BONUS_END,
             morning_bonus_mult=BA_MORNING_BONUS_MULT,
@@ -649,6 +688,14 @@ class MarketHopper:
 
         resolved = bool(market_data.get("resolved") or market_data.get("isResolved"))
         if not resolved:
+            # Fallback: check payout numerators or winning outcome hints
+            payout_nums = market_data.get("payoutNumerators") or market_data.get("payout_numerators")
+            if isinstance(payout_nums, list) and any(payout_nums):
+                try:
+                    idx = max(range(len(payout_nums)), key=lambda i: payout_nums[i])
+                    return True, idx
+                except Exception:
+                    pass
             return False, None
 
         tokens = market_data.get("tokens", []) if isinstance(market_data, dict) else getattr(market_data, "tokens", [])
@@ -669,6 +716,15 @@ class MarketHopper:
                         winner_index = int(idx)
                 if winner_index:
                     break
+        
+        # If still unknown, check payoutNumerators as last resort
+        if winner_index is None:
+            payout_nums = market_data.get("payoutNumerators") or market_data.get("payout_numerators")
+            if isinstance(payout_nums, list) and any(payout_nums):
+                try:
+                    winner_index = max(range(len(payout_nums)), key=lambda i: payout_nums[i])
+                except Exception:
+                    winner_index = None
 
         return resolved, winner_index
     
@@ -776,6 +832,13 @@ class MarketHopper:
                 
                 # Execute bundle arbitrage
                 await self.execute_bundle_arbitrage()
+
+                # Periodic resolution poller to trigger redemption if markets closed
+                now = time.time()
+                if now - self.last_resolution_poll > 60:
+                    self.last_resolution_poll = now
+                    for label in list(self.markets.keys()):
+                        await self._maybe_redeem_if_resolved(label)
                 
                 # Check if we've hit exposure limit
                 if self.arbitrageur and self.arbitrageur.position.total_exposure >= BA_MAX_TOTAL_EXPOSURE:
