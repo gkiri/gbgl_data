@@ -63,6 +63,12 @@ class MakerStrategy:
         self.clob_client: Optional[ClobClient] = None
         self.markets: Dict[str, MarketData] = {}  # 'BTC', 'ETH' -> MarketData
         self.open_orders: Dict[str, List[str]] = {} # token_id -> list of order_ids
+        self.last_quotes: Dict[str, float] = {}     # token_id -> last quoted price
+        # Simple inventory tracking per asset
+        self.position: Dict[str, Dict[str, float]] = {  # label -> {'YES': sh, 'NO': sh}
+            'BTC': {'YES': 0.0, 'NO': 0.0},
+            'ETH': {'YES': 0.0, 'NO': 0.0},
+        }
         self.running = True
 
     def init_client(self):
@@ -131,10 +137,24 @@ class MakerStrategy:
         try:
             for tid in token_ids:
                 self.clob_client.cancel_orders(token_id=tid)
-            for tid in token_ids:
                 self.open_orders.pop(tid, None)
         except Exception as e:
             print(f"[Maker] ⚠️ Error cancelling orders: {e}")
+
+    def _should_replace(self, token_id: str, new_price: float) -> bool:
+        """Decide if we should replace an existing quote based on price delta."""
+        if new_price <= 0:
+            return False
+        prev = self.last_quotes.get(token_id)
+        if prev is None:
+            return True
+        return abs(prev - new_price) >= MAKER_PRICE_DELTA
+
+    def _record_quote(self, token_id: str, price: float, order_id: Optional[str] = None):
+        if price > 0:
+            self.last_quotes[token_id] = price
+        if order_id:
+            self.open_orders.setdefault(token_id, []).append(order_id)
 
     async def update_market_books(self):
         """Fetch latest orderbook depth"""
@@ -204,47 +224,64 @@ class MakerStrategy:
         return bid_yes, bid_no
 
     async def manage_orders(self):
-        """Place or update orders"""
+        """Place or update orders (batched, with replace-on-delta and simple inventory skew)"""
         for label, market in self.markets.items():
             target_yes, target_no = self.calculate_my_bids(market)
-            
-            # Cancel existing orders for this market only if prices moved materially
-            token_ids = []
-            if target_yes > 0:
-                token_ids.append(market.yes_token)
-            if target_no > 0:
-                token_ids.append(market.no_token)
-            
-            await self.cancel_all_orders(token_ids)
-            
+
+            # Simple inventory skew: if long YES, shade YES down and NO up; vice versa
+            pos_yes = self.position.get(label, {}).get('YES', 0.0)
+            pos_no = self.position.get(label, {}).get('NO', 0.0)
+            imbalance = pos_yes - pos_no
+            if imbalance > 0:  # long YES, so bid less aggressively on YES, more on NO
+                target_yes = max(0.0, target_yes - MAKER_TICK_SIZE)
+                target_no = round(min(0.99, target_no + MAKER_TICK_SIZE), 2)
+            elif imbalance < 0:  # long NO
+                target_no = max(0.0, target_no - MAKER_TICK_SIZE)
+                target_yes = round(min(0.99, target_yes + MAKER_TICK_SIZE), 2)
+
             orders_to_place = []
-            
-            if target_yes > 0:
+            tokens_to_cancel: List[str] = []
+
+            if target_yes > 0 and self._should_replace(market.yes_token, target_yes):
+                tokens_to_cancel.append(market.yes_token)
                 orders_to_place.append(OrderArgs(
                     price=target_yes,
                     size=MAKER_ORDER_SIZE,
                     side=BUY,
                     token_id=market.yes_token
                 ))
-            
-            if target_no > 0:
+
+            if target_no > 0 and self._should_replace(market.no_token, target_no):
+                tokens_to_cancel.append(market.no_token)
                 orders_to_place.append(OrderArgs(
                     price=target_no,
                     size=MAKER_ORDER_SIZE,
                     side=BUY,
                     token_id=market.no_token
                 ))
-                
+
+            if tokens_to_cancel:
+                await self.cancel_all_orders(tokens_to_cancel)
+
             if orders_to_place:
-                print(f"[Maker] 💸 {label}: Placing bids YES@{target_yes:.2f}, NO@{target_no:.2f} (Sum: {target_yes+target_no:.2f})")
+                print(f"[Maker] 💸 {label}: Bids YES@{target_yes:.2f}, NO@{target_no:.2f} (Sum: {target_yes+target_no:.2f})")
                 try:
-                    for order in orders_to_place:
-                        o = self.clob_client.create_order(order)
-                        self.clob_client.post_order(o, OrderType.GTC)
+                    # Batch create and post
+                    created = [self.clob_client.create_order(o) for o in orders_to_place]
+                    resp = self.clob_client.post_orders(created, OrderType.GTC)
+                    # Record quotes/order ids if returned
+                    if isinstance(resp, list):
+                        for r, o in zip(resp, orders_to_place):
+                            oid = r.get('orderID') or r.get('id')
+                            self._record_quote(o.token_id, o.price, oid)
+                    else:
+                        # fallback if single response
+                        for o in orders_to_place:
+                            self._record_quote(o.token_id, o.price)
                 except Exception as e:
                     print(f"[Maker] ⚠️ Order placement failed: {e}")
             else:
-                print(f"[Maker] 💤 {label}: No valid bids calculated (targets too low?)")
+                print(f"[Maker] 💤 {label}: No quote changes (holding book)")
 
     async def run(self):
         self.init_client()
