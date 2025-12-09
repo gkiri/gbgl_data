@@ -905,8 +905,8 @@ class BundleArbitrageur:
         else:
             # Choose the side with the larger discount vs implied
             implied_yes = 1.00 - book.best_ask_no
-            implied_no = 1.00 - book.best_ask_yes
             discount_yes = implied_yes - book.best_ask_yes
+            implied_no = 1.00 - book.best_ask_yes
             discount_no = implied_no - book.best_ask_no
             target_side = "YES" if discount_yes >= discount_no else "NO"
 

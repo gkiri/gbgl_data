@@ -125,6 +125,13 @@ HOPPING_MOMENTUM_WEIGHT = float(os.getenv("HOPPING_MOMENTUM_WEIGHT", "0.40"))  #
 HOPPING_LIQUIDITY_WEIGHT = float(os.getenv("HOPPING_LIQUIDITY_WEIGHT", "0.20"))  # More depth = better
 HOPPING_FILL_WEIGHT = float(os.getenv("HOPPING_FILL_WEIGHT", "0.10"))          # Recent fills = better
 
+# Add this to config.py
+PHASE_CONFIG = {
+    "FORMATION": { "max_imbalance": 150.0, "aggression": "MEDIUM", "force_unwind": False, "use_spot": True },
+    "GRIND":     { "max_imbalance": 300.0, "aggression": "HIGH",   "force_unwind": False, "use_spot": False },
+    "RESOLUTION":{ "max_imbalance": 30.0,  "aggression": "LOW",    "force_unwind": True,  "use_spot": False }
+}
+
 # Switching behavior
 HOPPING_HYSTERESIS = float(os.getenv("HOPPING_HYSTERESIS", "0.20"))  # 20% advantage required to switch
 FOCUS_SWITCH_COOLDOWN_MS = int(os.getenv("FOCUS_SWITCH_COOLDOWN_MS", "2000"))  # Min ms between switches
