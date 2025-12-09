@@ -68,6 +68,9 @@ from config import (
 from chain_client import CTFSettlementClient
 from trade_logger import TradeLogger
 
+# Yield control between burst orders to avoid starving the WS loop
+GABA_BURST_DELAY = 0.05  # seconds
+
 
 # =============================================================================
 # BUNDLE ARBITRAGE CONFIGURATION
@@ -697,12 +700,15 @@ class DualSideSweeper:
         if not orders_to_place:
             return 0, 0, 0.0, 0.0
         
-        # Execute all orders concurrently for speed
+        # Execute all orders concurrently for speed, but yield between shots
         async def _execute_order(side, price, size):
             token_id = yes_token if side == 'YES' else no_token
-            return (side, await self.place_order(
+            result = await self.place_order(
                 token_id, side, price, size, market_slug, condition_id
-            ))
+            )
+            # Yield back to event loop so WS tasks can process diffs
+            await asyncio.sleep(GABA_BURST_DELAY)
+            return (side, result)
         
         tasks = [_execute_order(side, price, size) for side, price, size in orders_to_place]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -808,7 +814,9 @@ class DualSideSweeper:
         orders_to_place = [(side, price, clip_size)] * target_orders
         
         async def _execute(order_side, p, s):
-            return (order_side, await self.place_order(token_id, order_side, p, s, market_slug, condition_id))
+            result = await self.place_order(token_id, order_side, p, s, market_slug, condition_id)
+            await asyncio.sleep(GABA_BURST_DELAY)
+            return (order_side, result)
         
         tasks = [_execute(side, price, clip_size) for _ in orders_to_place]
         results = await asyncio.gather(*tasks, return_exceptions=True)

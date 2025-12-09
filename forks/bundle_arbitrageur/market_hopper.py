@@ -65,6 +65,7 @@ from config import (
     ENABLE_ONCHAIN_REDEEM,
 )
 from utils import get_target_markets, warm_connections
+from binance_client import BinanceFeed
 from trade_logger import TradeLogger
 from bundle_arbitrageur import (
     BundleArbitrageur, BundleConfig, OrderBookState, Position
@@ -222,6 +223,10 @@ class MarketHopper:
         
         # Session tracking
         self.session_start: float = time.time()
+
+        # External spot feed (Binance futures bookTicker mid)
+        self.binance_feed: Optional[BinanceFeed] = BinanceFeed()
+        self._binance_task: Optional[asyncio.Task] = None
         
         # Concurrency guard for reactive execution
         self._sweep_in_flight: bool = False
@@ -503,6 +508,12 @@ class MarketHopper:
         print(f"[Hopper] 🐙 Strategy: BUNDLE ARBITRAGE")
         print(f"[Hopper]    Target: bundle_cost < ${BA_MAX_BUNDLE_COST:.2f}")
         await self._restart_ws_listener()
+
+    def get_spot_price(self, asset_label: str) -> Optional[float]:
+        """Return latest Binance mid for BTC/ETH if available."""
+        if not self.binance_feed:
+            return None
+        return self.binance_feed.get_price(asset_label)
     
     async def _fetch_tokens(self, asset_label: str):
         """Fetch token IDs for a market with validation."""
@@ -1057,6 +1068,12 @@ class MarketHopper:
     async def run(self, target_fills: int = 20):
         """Main execution loop"""
         self.target_fills = target_fills
+
+        # Start Binance feed in background to power directional lean / diagnostics
+        if not self.binance_feed:
+            self.binance_feed = BinanceFeed()
+        if not self._binance_task:
+            self._binance_task = asyncio.create_task(self.binance_feed.start())
         
         await self.initialize_markets()
         
@@ -1159,6 +1176,10 @@ class MarketHopper:
             self.ws_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self.ws_task
+        if self.binance_feed:
+            self.binance_feed.stop()
+        if self._binance_task:
+            self._binance_task.cancel()
         self._print_stats()
     
     def _should_refresh_markets(self) -> bool:
