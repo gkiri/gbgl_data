@@ -133,27 +133,6 @@ FOCUS_SWITCH_COOLDOWN_MS = int(os.getenv("FOCUS_SWITCH_COOLDOWN_MS", "2000"))  #
 BURST_SIZE = int(os.getenv("BURST_SIZE", "5"))  # Trades per burst before re-evaluating
 BURST_INTERVAL_MS = int(os.getenv("BURST_INTERVAL_MS", "500"))  # Time between orders in burst
 
-# Phase configuration (single source of truth for PhaseManager)
-PHASE_CONFIG = {
-    "FORMATION": {
-        "max_imbalance": float(os.getenv("PHASE_FORMATION_MAX_IMBALANCE", "150.0")),
-        "aggression": "MEDIUM",
-        "force_unwind": False,
-        "use_spot": True,
-    },
-    "GRIND": {
-        "max_imbalance": float(os.getenv("PHASE_GRIND_MAX_IMBALANCE", "300.0")),
-        "aggression": "HIGH",
-        "force_unwind": False,
-        "use_spot": False,
-    },
-    "RESOLUTION": {
-        "max_imbalance": float(os.getenv("PHASE_RESOLUTION_MAX_IMBALANCE", "30.0")),
-        "aggression": "LOW",
-        "force_unwind": True,
-        "use_spot": False,
-    },
-}
 
 def _get_float(*keys, default):
     for key in keys:
@@ -205,3 +184,28 @@ MERGE_GAS_LIMIT = 450000
 TOKEN_DECIMALS = int(os.getenv("TOKEN_DECIMALS", str(USDC_DECIMALS)))
 ENABLE_ONCHAIN_MERGE = os.getenv("ENABLE_ONCHAIN_MERGE", "true").lower() == "true"
 ENABLE_ONCHAIN_REDEEM = os.getenv("ENABLE_ONCHAIN_REDEEM", "true").lower() == "true"
+
+
+
+# --- GABAGOOL PHASE CONFIG ---
+PHASE_CONFIG = {
+    "FORMATION": {
+        "max_imbalance": float(os.getenv("PHASE_FORMATION_MAX_IMBALANCE", "150.0")),
+        "aggression": "MEDIUM",
+        "force_unwind": False,
+        "use_spot": True,
+    },
+    "GRIND": {
+        "max_imbalance": float(os.getenv("PHASE_GRIND_MAX_IMBALANCE", "300.0")),
+        "aggression": "HIGH",
+        "force_unwind": False,
+        "use_spot": False,
+    },
+    "RESOLUTION": {
+        "max_imbalance": float(os.getenv("PHASE_RESOLUTION_MAX_IMBALANCE", "30.0")),
+        "aggression": "LOW",
+        "force_unwind": True,
+        "use_spot": False,
+    },
+}
+
