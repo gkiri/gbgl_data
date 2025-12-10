@@ -908,7 +908,15 @@ class BundleArbitrageur:
             discount_yes = implied_yes - book.best_ask_yes
             implied_no = 1.00 - book.best_ask_yes
             discount_no = implied_no - book.best_ask_no
-            target_side = "YES" if discount_yes >= discount_no else "NO"
+            
+            # CORRECT LOGIC: Break the mathematical tie using INVENTORY
+            if self.position.yes_shares > self.position.no_shares:
+                target_side = "NO"  # We are heavy YES, so buy NO
+            elif self.position.no_shares > self.position.yes_shares:
+                target_side = "YES" # We are heavy NO, so buy YES
+            else:
+                # If balanced, vacuum the side with MORE liquidity
+                target_side = "YES" if book.best_ask_yes_size >= book.best_ask_no_size else "NO"
 
         target_token = self.yes_token if target_side == "YES" else self.no_token
         target_price = book.best_ask_yes if target_side == "YES" else book.best_ask_no
