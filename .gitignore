@@ -21,9 +21,13 @@ __pycache__/
 Thumbs.db
 
 # Data & Logs
-data/
+data/*
+!data/btc_15m_daily_trades/
+!data/btc_15m_daily_trades/**
 *.log
 *.json
+!data/btc_15m_daily_trades/*.json.gz
+!data/btc_15m_daily_trades/btc_15m_trades_summary.json
 
 # IDE
 .vscode/
