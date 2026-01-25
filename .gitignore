@@ -24,6 +24,9 @@ Thumbs.db
 data/*
 !data/btc_15m_daily_trades/
 !data/btc_15m_daily_trades/**
+!data/0x8dxd
+!data/gabagool
+!data/swisstony
 *.log
 *.json
 !data/btc_15m_daily_trades/*.json.gz

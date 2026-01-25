@@ -217,6 +217,58 @@ def normalize_resolved_arg(value):
         return value
     return None
 
+def load_trades_from_json(json_file):
+    """Load trades from a JSON file that is either a list or a wrapper dict."""
+    with open(json_file, "r") as f:
+        raw = json.load(f)
+    if isinstance(raw, list):
+        return raw, None
+    if isinstance(raw, dict):
+        trades = raw.get("trades")
+        if isinstance(trades, list):
+            return trades, raw
+    raise ValueError("JSON must be a list of trades or contain a 'trades' list.")
+
+def _matches_filter(candidate, needle, allow_substring=True):
+    if candidate is None:
+        return False
+    candidate_str = str(candidate).lower()
+    needle_str = str(needle).lower()
+    if allow_substring:
+        return needle_str in candidate_str
+    return candidate_str == needle_str
+
+def filter_trades(trades, title=None, slug=None, condition_id=None):
+    """Filter trades by title, slug, or condition id (substring match)."""
+    if not (title or slug or condition_id):
+        return trades
+
+    filtered = []
+    for trade in trades:
+        if title and not _matches_filter(trade.get("title"), title):
+            continue
+
+        if slug:
+            slug_match = (
+                _matches_filter(trade.get("slug"), slug)
+                or _matches_filter(trade.get("eventSlug"), slug)
+                or _matches_filter(trade.get("_market_slug"), slug)
+            )
+            if not slug_match:
+                continue
+
+        if condition_id:
+            condition_match = (
+                _matches_filter(trade.get("conditionId"), condition_id)
+                or _matches_filter(trade.get("_condition_id"), condition_id)
+                or _matches_filter(trade.get("condition_id"), condition_id)
+            )
+            if not condition_match:
+                continue
+
+        filtered.append(trade)
+    return filtered
+
 def infer_resolved_side_from_trades(trades, threshold=PRICE_RESOLUTION_THRESHOLD):
     """Infer resolved side from the most recent trade price."""
     if not trades:
@@ -347,6 +399,11 @@ def main():
     parser.add_argument("--market", help="Market name query")
     parser.add_argument("--condition-id", help="Direct Condition ID")
     parser.add_argument("--user", help="User address")
+    parser.add_argument("--filter-title", help="Filter trades by market title (substring match)")
+    parser.add_argument("--filter-slug", help="Filter trades by market slug (substring match)")
+    parser.add_argument("--filter-condition-id", help="Filter trades by condition id (substring match)")
+    parser.add_argument("--output-trades", help="Output filtered trades JSON file path")
+    parser.add_argument("--export-only", action="store_true", help="Exit after writing output trades")
     parser.add_argument("--output-report", help="Output report file path", default=DEFAULT_REPORT_FILE)
     parser.add_argument("--output-chart", help="Output chart file path", default="chart.png")
     
@@ -357,17 +414,43 @@ def main():
 
     if json_file:
         try:
-            with open(json_file, "r") as f:
-                raw_data = json.load(f)
+            raw_data, wrapper = load_trades_from_json(json_file)
         except FileNotFoundError:
             print(f"Error: File '{json_file}' not found.")
             return
         except json.JSONDecodeError:
             print(f"Error: File '{json_file}' is not valid JSON.")
             return
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return
+
         if not raw_data:
             print("No trades found.")
             return
+
+        original_count = len(raw_data)
+        raw_data = filter_trades(
+            raw_data,
+            title=args.filter_title,
+            slug=args.filter_slug,
+            condition_id=args.filter_condition_id,
+        )
+
+        if not raw_data:
+            print("No trades matched the provided filters.")
+            return
+
+        if len(raw_data) != original_count:
+            print(f"Filtered trades: {len(raw_data)} of {original_count}")
+
+        if args.output_trades:
+            with open(args.output_trades, "w") as f:
+                json.dump(raw_data, f, indent=2)
+            print(f"Filtered trades saved to {args.output_trades}")
+            if args.export_only:
+                return
+
         market_title = raw_data[0].get("title", "Unknown Market")
         condition_id = raw_data[0].get("conditionId", "")
     else:
