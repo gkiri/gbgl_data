@@ -27,6 +27,7 @@ data/*
 !data/0x8dxd
 !data/gabagool
 !data/swisstony
+!data/purple
 *.log
 *.json
 !data/btc_15m_daily_trades/*.json.gz
