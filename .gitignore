@@ -1,45 +1,11 @@
-# Environment
-.env
-venv/
-.venv/
+htop
 
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-*.egg
-*.egg-info/
-
-# Secrets
-*.pem
-*.key
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Data & Logs
+# Local data artifacts (do not commit)
 data/*
-!data/btc_15m_daily_trades/
-!data/btc_15m_daily_trades/**
-!data/0x8dxd
-!data/gabagool
-!data/swisstony
-!data/purple
-*.log
-*.json
-!data/btc_15m_daily_trades/*.json.gz
-!data/btc_15m_daily_trades/btc_15m_trades_summary.json
-
-# IDE
-.vscode/
-.idea/
 *.swp
 *.swo
+*.swx
 
-# Test artifacts
-.pytest_cache/
-.coverage
-htmlcov/
+# ...but track E594
+!data/E594/
+!data/E594/**
